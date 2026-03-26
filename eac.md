@@ -116,6 +116,16 @@ state = ROL(state, N)
 
 Each encrypted string has a hardcoded seed loaded into a register, followed by a byte-by-byte XOR loop, then typically a string comparison. The decrypted content is zeroed after use.
 
+### String Decryption Limitations (Runtime Dump)
+
+Automated string decryption was attempted via IDA bridge using brute-force PRNG matching across `.rdata`, `.data`, and `seg004` sections with all three algorithm variants (XorShift, XorShift+NOT, LCG) and multiple ROL/ROR parameters. **Zero strings were recovered** from the dump.
+
+This is expected behavior: EAC zeroes encrypted string buffers immediately after decryption and comparison at runtime. In a runtime memory dump, the decrypted strings have already been consumed and wiped. Successful string recovery requires either:
+
+1. **Live interception**: Hooking the decrypt function during execution and capturing output before zeroing
+2. **Static binary analysis**: Working with the on-disk `.sys` file before runtime unpacking
+3. **Memory breakpoint approach**: Setting write breakpoints on encrypted buffers during driver load
+
 ### Pool Tag Table
 
 The pool tag randomization table is visible at `0xFFFFF8030E0F84A0` containing 46 concatenated 4-byte tags:
