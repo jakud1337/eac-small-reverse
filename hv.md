@@ -1,215 +1,447 @@
-# EAC EOS Driver - Anti-Hypervisor / Anti-VM Analysis
+# EAC EOS Driver - Anti-Hypervisor Detection Analysis (From Dump)
 
-## Overview
+All findings below are extracted directly from the runtime dump of `EasyAntiCheat_EOS_patched.sys` via IDA Pro disassembly and byte-pattern scanning. Addresses are from the loaded image base `0xFFFFF803267A0000`.
 
-EAC deploys multiple layers of hypervisor and virtual machine detection. These target both Type-1 (bare-metal) and Type-2 (hosted) hypervisors, as well as analysis environments. The majority of these checks reside in the 34 MB virtualized section, making static analysis challenging. This document catalogs the detection methods based on resolved imports, instruction pattern analysis, and decompilation of `.text` section code.
+## Instruction Counts Summary
 
-## Detection Method Categories
+| Instruction | Count | Location |
+|------------|-------|----------|
+| CPUID | 33 | 23 in `.text`, 10 in `seg007` |
+| RDTSC | 10 | `.text` |
+| RDTSCP | 1 | `.text` |
+| RDMSR | 8 | `.text` |
+| WRMSR | 10 | `.text` |
+| SGDT | 1 | VM dispatcher |
+| SIDT | 1 | VM dispatcher |
+| WBINVD | 1 | VM dispatcher |
+| CR reads | 164 | all segments |
+| CR8 reads | 59 | `.text` (IRQL manipulation) |
+| Port I/O | 4 real | `.text` (PCI config) |
+| KUSER_SHARED_DATA refs | 25 | `.text` |
 
-### 1. CPUID-Based Detection
+---
 
-**Leaf 0x1 (Feature Information)**
-- ECX bit 31: Hypervisor Present bit
-- When set, indicates the processor is running under a hypervisor
-- EAC checks this on initialization and periodically during runtime
-- Affects both Type-1 (Hyper-V, VMware ESXi) and Type-2 (VirtualBox, VMware Workstation)
+## 1. CPUID Detection (33 instructions)
 
-**Leaf 0x40000000 (Hypervisor Vendor String)**
-- Returns hypervisor vendor ID in EBX:ECX:EDX
-- Known vendor strings checked:
-  - `Microsoft Hv` (Hyper-V)
-  - `VMwareVMware` (VMware)
-  - `KVMKVMKVM\0\0\0` (KVM)
-  - `VBoxVBoxVBox` (VirtualBox)
-  - `XenVMMXenVMM` (Xen)
-- Even with CPUID masking, some hypervisors leak through timing analysis
+### 1.1 Primary: CPUID Leaf 1 + RDTSC Timing Loop
 
-**Leaf 0x40000001-0x4000000F (Hypervisor Information Leaves)**
-- Additional hypervisor-specific feature enumeration
-- Hyper-V exposes partition ID, synthetic MSR support, etc.
+| Field | Value |
+|-------|-------|
+| Address | `0xFFFFF803267C8402` |
+| Function | `sub_FFFFF803267C83B4` |
+| Segment | `.text` |
 
-### 2. Timing-Based Detection
+This is the main hypervisor detection. It executes CPUID leaf 1 and checks **ECX bit 31** (hypervisor present). The check is wrapped in a calibrated timing loop:
 
-**RDTSC / RDTSCP Delta Analysis**
-- EAC uses high-resolution timestamp counters to detect VMEXIT overhead
-- Pattern: bracketed RDTSC around privileged instructions
-- Expected delta for bare-metal: ~20-50 cycles
-- Hypervisor VMEXIT overhead: typically 500-5000+ cycles
-- Multiple measurements are taken and averaged to account for interrupts
+1. Raises IRQL to 15 via `mov cr8, 0Fh` (prevents interrupts)
+2. Loops 100 iterations: `rdtsc` -> `cpuid(1)` -> `rdtsc` -> accumulate delta
+3. Runs a separate calibration loop of 100 `rdtsc` -> `rdtsc` pairs
+4. Stores all 4 result registers (EAX/EBX/ECX/EDX) to stack buffer
+5. Passes results to `sub_FFFFF803267C81A8` which dispatches into `seg007`
 
-**SharedUserData.InterruptTime**
-- Cross-referenced with RDTSC for consistency checking
-- Hypervisors that only intercept one source create detectable skew
+Detection vectors:
+- **Direct**: ECX bit 31 (hypervisor present flag)
+- **Timing**: Compares CPUID execution time vs raw RDTSC overhead. VM exit/entry adds ~1000-5000 cycles that bare metal doesn't have
+- **Anti-interference**: CR8 raised to prevent interrupt-based timing noise
 
-**KeQuerySystemTimePrecise** (resolved import)
-- High-precision kernel timer used for timing analysis
-- Can detect artificial time speedup/slowdown from sandboxes
+Called from `seg007` at `0xFFFFF80328C868B8`.
 
-### 3. MSR-Based Detection
+### 1.2 CPUID Leaf 0 - Vendor Validation
 
-**IA32_VMX_BASIC (MSR 0x480)**
-- Only readable when VMX is enabled (CR4.VMXE = 1)
-- Attempting to read on non-virtualized hardware causes #GP
-- If readable, confirms VMX is active
+| Address | Function | Purpose |
+|---------|----------|---------|
+| `0xFFFFF803267FBE84` | `sub_FFFFF803267FBE64` | Basic vendor read |
+| `0xFFFFF80326899D58` | `sub_FFFFF80326899CAC` | Intel PT context |
+| `0xFFFFF803269064E9` | `sub_FFFFF803269064C0` | Full vendor validation |
 
-**IA32_FEATURE_CONTROL (MSR 0x3A)**
-- Bit 0: Lock bit
-- Bit 2: Enable VMX outside SMX
-- Reading and interpreting these bits reveals VMX state
+`sub_FFFFF803269064C0` is comprehensive:
+- Reads CPUID leaf 0, checks EBX:EDX:ECX against `GenuineIntel` and `AuthenticAMD`
+- Then reads leaf 1 for model/stepping (`cmp eax, 0B0671h` = Raptor Lake)
+- Extracts feature bits: SSE4.2, POPCNT, AES-NI, AVX, RDRAND (ECX); SSE2, FXSR (EDX)
+- Hypervisors that return non-standard vendor strings or wrong feature combinations are caught
 
-**HV-Specific MSRs**
-- MSR 0x40000000-0x400000FF: Hyper-V synthetic MSR range
-- MSR 0x4B564D00-0x4B564DFF: KVM MSR range
-- Attempting to read these on non-virtualized hardware causes #GP
+### 1.3 CPUID Leaf 7 - Extended Features (SHA-NI)
 
-**Detection Pattern**:
+| Address | Function |
+|---------|----------|
+| `0xFFFFF803267ADB69` | `sub_FFFFF803267ADB38` |
+| `0xFFFFF803267D8650` | `sub_FFFFF803267D8634` |
+| `0xFFFFF803267D86CE` | `sub_FFFFF803267D8678` |
+| `0xFFFFF80326906635` | `sub_FFFFF803269064C0` |
+
+Check EBX bit 29 (`0x20000000` = SHA-NI). Result cached at `dword_FFFFF803269AF0BC`. If a hypervisor incorrectly filters leaf 7, mismatch is detectable.
+
+### 1.4 CPUID Leaf 0x14 - Intel Processor Trace Probe
+
+| Address | Function |
+|---------|----------|
+| `0xFFFFF80326899D58` | `sub_FFFFF80326899CAC` |
+
+This function:
+1. Zeroes MSR 0x570 (IA32_RTIT_CTL) to disable PT
+2. Zeroes MSRs 0x571, 0x560, 0x561 (status, output base, output mask)
+3. Gets PT output region via dynamically resolved API
+4. Writes RTIT_OUTPUT_BASE (0x560) with the physical address
+5. Reads CPUID leaf 0x14 for PT capabilities
+6. Configures RTIT_CTL (0x570) with tracing parameters
+
+Hypervisors that intercept Intel PT MSRs or leaf 0x14 produce anomalous results. EAC may use PT output as a trusted timing source bypassing RDTSC interception.
+
+### 1.5 VM Dispatcher CPUID (Case 120)
+
+| Address | Function |
+|---------|----------|
+| `0xFFFFF803268D0FDE` | `sub_FFFFF803268D0280` |
+
+Inside the 11,400-byte VM instruction dispatcher, case 120 executes CPUID with EAX/ECX loaded from the VM context (`[rsi+8]` and `[rsi+10h]`). The VM can execute **any** CPUID leaf.
+
+### 1.6 VM Section CPUID Stubs (10 in seg007)
+
+| Address | Notes |
+|---------|-------|
+| `0xFFFFF80326A5F4F0` | Saves EBX only |
+| `0xFFFFF80326A60CA4` | Saves all 4 regs |
+| `0xFFFFF80326A6497F` | Saves all 4 regs |
+| `0xFFFFF80326A6E27B` | Saves all 4 regs |
+| `0xFFFFF80326A71E2B` | Saves all 4 regs |
+| `0xFFFFF80326A79CF9` | Saves all 4 regs |
+| `0xFFFFF80326A9CDA0` | Saves all 4 regs |
+| `0xFFFFF80326AA99FD` | Saves all 4 regs |
+| `0xFFFFF80326AAB1BD` | Saves EAX only |
+| `0xFFFFF80326AABC08` | Saves all 4 regs |
+
+All load EAX from `[rsp+190h]` (VM context) and ECX from `[rsp+194h]`. The actual leaf values are determined at runtime by VM bytecode - cannot be statically determined.
+
+---
+
+## 2. RDTSC/RDTSCP Timing (11 instructions)
+
+### 2.1 CPUID Timing Loop
+
+| Address | Role |
+|---------|------|
+| `0xFFFFF803267C83EF` | Pre-CPUID timestamp |
+| `0xFFFFF803267C8410` | Post-CPUID timestamp |
+| `0xFFFFF803267C842D` | Calibration loop start |
+| `0xFFFFF803267C8439` | Calibration loop end |
+
+Two-phase: 100x CPUID-bracketed RDTSC + 100x raw RDTSC calibration. Computes excess latency caused by VM exit.
+
+### 2.2 Pool Tag PRNG Seeding
+
+| Address | Function |
+|---------|----------|
+| `0xFFFFF8032684A053` | `sub_FFFFF80326849FF4` |
+| `0xFFFFF8032684A1C4` | `sub_FFFFF80326849FF4` |
+
+Seeds pool tag randomization PRNG. Not HV detection but uses RDTSC for entropy.
+
+### 2.3 PRNG / Timing Check
+
+| Address | Function | Notes |
+|---------|----------|-------|
+| `0xFFFFF8032685813B` | `sub_FFFFF80326858128` | MSVC CRT PRNG seed (mult `0x343FD`, add `0x269EC3`) |
+| `0xFFFFF80326858196` | `sub_FFFFF80326858180` | `sub rcx, r9; cmp rcx, 4` - timing validation |
+
+RDTSC at `0x858196` computes a delta with `cmp rcx, 4` - detects if interval is suspiciously small (RDTSC interception/offsetting).
+
+### 2.4 VM Dispatcher RDTSC/RDTSCP
+
+| Address | Instruction | VM Case |
+|---------|------------|---------|
+| `0xFFFFF803268D1F8B` | RDTSC | 689 |
+| `0xFFFFF803268D1FAE` | RDTSCP | 690 |
+
+RDTSCP additionally returns processor ID in ECX, which can detect cross-core migration from hypervisor scheduling.
+
+---
+
+## 3. MSR-Based Detection (8 RDMSR + 10 WRMSR)
+
+### 3.1 Hyper-V Synthetic MSR Probe (CRITICAL)
+
+| Address | Function | MSR |
+|---------|----------|-----|
+| `0xFFFFF803267FB88D` | `sub_FFFFF803267FB87C` | `0x40000001` (HV_X64_MSR_HYPERCALL) |
+
+Reads MSR 0x40000001 which contains the Hyper-V hypercall page physical address. This MSR **only exists under Hyper-V compatible hypervisors**. On bare metal or non-Hyper-V hypervisors, RDMSR will #GP fault. Wrapped in exception handling - if the read succeeds, a hypervisor is present.
+
+Called from `seg007` at `0xFFFFF80328C87254`.
+
+### 3.2 TSX Control MSR Write-Verify Probe
+
+| Address | Function | MSR |
+|---------|----------|-----|
+| `0xFFFFF8032680753D` | `sub_FFFFF80326807534` | `0x122` (IA32_TSX_CTRL) |
+
+Sequence:
+1. Read MSR 0x122
+2. `cli` (disable interrupts)
+3. Clear bit 0 (RTM_DISABLE) and write back
+4. Re-read to verify the write took effect
+5. Check if bit 0 was successfully cleared (`not r8b; and r8b, 1`)
+6. Restore original value and `sti`
+
+Hypervisors that intercept MSR writes may silently drop the IA32_TSX_CTRL toggle. If the write fails (bit stays set), EAC detects MSR interception.
+
+### 3.3 AMD Performance Counter Read
+
+| Address | Function | MSR |
+|---------|----------|-----|
+| `0xFFFFF803268C9FB4` | `sub_FFFFF803268C9F70` | `0xC0010201` (AMD PERF_EVT_SEL1) |
+
 ```
-rdmsr(0x480)    // if no #GP -> VMX is enabled
-rdmsr(0x3A)     // check VMX enable bits
-rdmsr(0x40000000)  // if no #GP -> Hyper-V present
+lfence
+rdmsr 0xC0010201
+lfence
 ```
 
-### 4. CR4.VMXE (Bit 13)
+LFENCE barriers ensure serialized read. Performance counters are an alternative timing source harder for hypervisors to intercept compared to RDTSC.
 
-- CR4 bit 13 (VMXE) is set when VMX operation is enabled
-- EAC reads CR4 and checks this bit directly
-- On bare-metal without virtualization, this bit is clear
-- Pattern in code: `mov rax, cr4 ; test eax, 2000h`
-- This is a reliable indicator but can be masked by a well-implemented hypervisor that intercepts CR4 reads
+Called from `seg007` at `0xFFFFF80328C892C4` and `0xFFFFF80328C892D0`.
 
-### 5. SIDT / SGDT / SLDT Checks
+### 3.4 SMI Count Read
 
-**Interrupt Descriptor Table (IDT)**
-- `sidt` stores the IDT base address and limit
-- On bare-metal: IDT base is in a known kernel range
-- Under Type-2 hypervisors (especially older ones): IDT may be relocated
-- EAC checks for IDT base addresses outside expected ranges
+| Address | Function | MSR |
+|---------|----------|-----|
+| `0xFFFFF803268CA011` | `sub_FFFFF803268CA000` | `0x34` (MSR_SMI_COUNT) |
 
-**Global Descriptor Table (GDT)**
-- `sgdt` stores the GDT base and limit
-- Similar analysis as IDT: unexpected GDT location indicates virtualization
+On bare metal: monotonically increasing small number. Hypervisors may return 0, anomalous values, or #GP fault.
 
-**Local Descriptor Table (LDT)**
-- `sldt` returns the LDT selector
-- On most modern Windows systems: LDT selector is 0
-- Non-zero LDT may indicate virtualization or sandboxing
+### 3.5 APIC Base MSR
 
-**Note**: Modern Type-1 hypervisors (Hyper-V, VMware ESXi) handle these checks gracefully by keeping descriptor tables at expected addresses. These checks primarily catch older or poorly-implemented Type-2 hypervisors.
+| Address | Function | MSR |
+|---------|----------|-----|
+| `0xFFFFF803268B6DED` | `sub_FFFFF803268B6DE4` | `0x1B` (IA32_APIC_BASE) |
 
-### 6. Memory Artifact Detection
+Reads APIC base address. Hypervisors virtualize the APIC; inconsistencies can reveal virtualization.
 
-**Physical Memory Range Analysis**
-- `MmGetPhysicalMemoryRanges` (resolved import)
-- EAC enumerates physical memory ranges and checks for anomalies
-- Hypervisors may report different physical memory layouts
-- Memory holes or unexpected ranges indicate virtualization
+### 3.6 Intel PT MSRs
 
-**Physical Address Translation**
-- `MmGetPhysicalAddress` / `MmGetVirtualForPhysical` (resolved imports)
-- Page table walking at PML4 -> PDPT -> PD -> PT levels
-- EAC walks page tables directly via CR3 to detect hidden memory
-- Mismatches between API results and manual page table walks indicate hypervisor memory manipulation
+| MSR | Name | Operations |
+|-----|------|------------|
+| `0x560` | IA32_RTIT_OUTPUT_BASE | Read + Write |
+| `0x561` | IA32_RTIT_OUTPUT_MASK_PTRS | Write (zeroed) |
+| `0x570` | IA32_RTIT_CTL | Write (configure + enable) |
+| `0x571` | IA32_RTIT_STATUS | Write (zeroed) |
 
-**Contiguous Memory Probing**
-- `MmAllocateContiguousNodeMemory` / `MmFreeContiguousMemory` (resolved imports)
-- Allocating contiguous physical memory and verifying it behaves as expected
-- Some hypervisors have issues with large contiguous physical allocations
+All in `sub_FFFFF80326899CAC`. See section 1.4.
 
-### 7. Device and Hardware Fingerprinting
+### 3.7 VM Dispatcher RDMSR/WRMSR
 
-**I/O Space Mapping**
-- `MmMapIoSpaceEx` / `MmMapVideoDisplay` / `MmUnmapVideoDisplay` (resolved imports)
-- Mapping physical MMIO regions and reading hardware-specific registers
-- VMs often emulate these regions with detectable differences
-- Video display mapping can reveal virtualized GPU
+| Address | VM Case | Notes |
+|---------|---------|-------|
+| `0xFFFFF803268D1F10` | 679 | Generic RDMSR (ECX from VM context) |
+| `0xFFFFF803268D298C` | WRMSR | Generic MSR write |
 
-**Device Object Enumeration**
-- `IoEnumerateDeviceObjectList` (resolved import)
-- `IoGetDeviceObjectPointer` (resolved import)
-- `IoGetDeviceInterfaces` (resolved import)
-- Enumerating device drivers and checking for virtualization-related devices:
-  - VMware Tools drivers
-  - VirtualBox Guest Additions
-  - Hyper-V Integration Services
+The VM can read/write **any** MSR via the dispatcher.
 
-## Type-1 vs Type-2 Detection Matrix
+---
 
-| Method | Type-1 (Hyper-V, ESXi) | Type-2 (VBox, VMware WS) |
-|--------|----------------------|--------------------------|
-| CPUID leaf 0x1 bit 31 | Detected | Detected |
-| CPUID vendor string | Detected (unless hidden) | Detected (unless hidden) |
-| RDTSC timing | Hard to detect (low overhead) | Detectable (higher overhead) |
-| MSR reads | May #GP correctly | May expose synthetic MSRs |
-| CR4.VMXE | Intercepted/hidden by good HVs | Often visible |
-| SIDT/SGDT relocation | Correctly handled | May be relocated |
-| Memory range anomalies | Minimal anomalies | More noticeable gaps |
-| Device enumeration | Integration services visible | Guest tools visible |
-| Physical page table walk | Correctly nested | May show discrepancies |
+## 4. Control Register Checks
 
-### Type-1 Evasion Difficulty
+| Register | Reads | Writes | Key Purpose |
+|----------|-------|--------|-------------|
+| CR0 | 1 | 1 | PE/PG/WP bits |
+| CR2 | 1 | 1 | Page fault address |
+| CR3 | 2 | 1 | Page directory base (page table walking) |
+| CR4 | 1 | 1 | **VMXE bit 13** |
+| CR8 | 59 | 4 | IRQL manipulation |
 
-Modern Type-1 hypervisors are significantly harder to detect because:
-- CPUID can be intercepted and modified at VMEXIT
-- MSR reads can be fully emulated
-- Descriptor tables remain at expected addresses
-- Memory layout is cleaner (direct physical access)
-- Timing overhead is lower (~100-300 cycles per VMEXIT)
+### CR4 Read - VMX Enable Detection
 
-The most reliable detection against Type-1 is timing analysis: even the fastest hypervisors add measurable overhead to privileged instruction execution. EAC uses bracketed RDTSC measurements with statistical averaging to detect this.
+| Address | Function |
+|---------|----------|
+| `0xFFFFF803267C4DBD` | `sub_FFFFF803267C4C00` (generic CR read dispatcher) |
 
-### Type-2 Evasion Difficulty
+CR4 bit 13 (VMXE) = VMX extensions enabled. Set by Intel VT-x hypervisors. The read is in a dispatcher function that selects CR0-CR4/CR8 based on a parameter.
 
-Type-2 hypervisors leave more artifacts:
-- Higher VMEXIT overhead (500+ cycles)
-- Guest tools/drivers are often loaded
-- BIOS/ACPI tables may contain VM-specific strings
-- Hardware enumeration reveals emulated devices
+The 59 CR8 reads are IRQL manipulation - raising IRQL before sensitive operations (timing, MSR probing) to prevent interrupt interference.
 
-## IRQL-Based Detection Bypass
+---
 
-Several detection paths check IRQL before executing:
+## 5. Descriptor Table Instructions
 
-```asm
-mov rax, cr8          ; KeGetCurrentIrql()
-cmp al, 2             ; DISPATCH_LEVEL
-jb  continue_detection
-xor eax, eax          ; return 0 - skip
-ret
-```
+### SGDT (Case 738)
 
-Code running at DISPATCH_LEVEL (2) or higher skips certain detection routines. However, page table walking and hash verification execute regardless of IRQL.
+| Address | Function |
+|---------|----------|
+| `0xFFFFF803268D24A6` | `sub_FFFFF803268D0280` |
 
-## SHA-1 Module Integrity
+`sgdt fword ptr [rax]` - stores GDT base and limit. Hypervisors with their own GDT may have a base differing from the expected kernel range.
 
-EAC computes SHA-1 hashes of driver code sections using standard IVs:
-```
-h0 = 0x67452301
-h1 = 0xEFCDAB89
-h2 = 0x98BADCFE
-h3 = 0x10325476
-h4 = 0xC3D2E1F0
-```
+### SIDT (Case 754)
 
-The computed hash is compared against an expected value. Any modification to the driver's `.text` section (patching, hooking) triggers detection. The hash result is stored at a known location in the `.data` section.
+| Address | Function |
+|---------|----------|
+| `0xFFFFF803268D2574` | `sub_FFFFF803268D0280` |
 
-## WinTrust / Authenticode
+`sidt fword ptr [rax]` - stores IDT base. IDT base in hypervisor memory range rather than normal kernel space is a detection vector. Both accessible to VM bytecode via the dispatcher.
 
-Certificate validation GUIDs found in `.data`:
-- `{F750E6C3-38EE-11D1-85E5-00C04FC295EE}` - WINTRUST_ACTION_GENERIC_VERIFY_V2
+---
 
-EAC validates Authenticode signatures on drivers and processes. Standard CA chain validation is used (no certificate pinning detected).
+## 6. PCI Config Space Direct Access
 
-## Summary
+| Address | Function | Port | Operation |
+|---------|----------|------|-----------|
+| `0xFFFFF8032683913B` | `sub_FFFFF80326839058` | 0xCF8 | Config address write |
+| `0xFFFFF8032683914D` | `sub_FFFFF80326839058` | 0xCFC | Config data write |
+| `0xFFFFF80326839E0B` | `sub_FFFFF80326839D5C` | 0xCF8 | Config address write |
+| `0xFFFFF80326839E16` | `sub_FFFFF80326839D5C` | 0xCFC | Config data write |
 
-EAC employs a defense-in-depth approach to hypervisor detection:
+Direct PCI configuration space access (ports 0xCF8/0xCFC) bypasses Windows PCI APIs. Detects:
+- Virtual PCI devices with known hypervisor vendor/device IDs
+- VMware SVGA adapter (PCI device ID 0x0405/0x0710)
+- VirtualBox Guest Additions PCI device
+- Missing physical hardware
 
-1. **CPUID checks** catch naive hypervisors that don't mask the HV present bit
-2. **Timing analysis** catches all hypervisors through VMEXIT overhead measurement
-3. **MSR probing** detects VMX state and hypervisor-specific MSR ranges
-4. **CR4.VMXE** provides a quick check for VMX operation
-5. **Descriptor table checks** catch older/simpler hypervisors
-6. **Physical memory analysis** detects memory layout anomalies
-7. **Device enumeration** finds virtualization guest tools
-8. **Module integrity** prevents code patching as a bypass
+**No VMware backdoor port (0x5658) found** in `.text`. If EAC checks it, it's through VM bytecode.
 
-The most difficult checks to bypass are timing analysis (requires near-zero overhead) and physical page table walking (requires perfect EPT/NPT implementation). The IRQL-based bypass only affects a subset of checks.
+---
+
+## 7. KUSER_SHARED_DATA References (25)
+
+### SystemTime Reads
+
+| Address | Function |
+|---------|----------|
+| `0xFFFFF803267B6C33` | `sub_FFFFF803267B6C2C` |
+| `0xFFFFF803267F20B6` | `sub_FFFFF803267F1E74` |
+| `0xFFFFF8032680F2C9` | `sub_FFFFF8032680F2B0` |
+| `0xFFFFF80326820BD1` | `sub_FFFFF80326820BA8` |
+| `0xFFFFF8032682253C` | `sub_FFFFF80326822448` |
+| `0xFFFFF8032683DE91` | standalone |
+| `0xFFFFF803268675C5` | standalone |
+| `0xFFFFF8032686969F` | `sub_FFFFF80326869644` |
+| `0xFFFFF8032689A3F9` | `sub_FFFFF8032689A208` |
+
+### InterruptTime Reads
+
+| Address | Function | Offsets |
+|---------|----------|---------|
+| `0xFFFFF803267F20EB` | `sub_FFFFF803267F1E74` | +0x8 |
+| `0xFFFFF803267F2106` | `sub_FFFFF803267F1E74` | +0xC |
+| `0xFFFFF803267F778B` | standalone | +0x8, +0xC, +0x10, +0x258, +0x2BC |
+| `0xFFFFF8032689A42D` | `sub_FFFFF8032689A208` | +0x8 |
+| `0xFFFFF8032689A44D` | `sub_FFFFF8032689A208` | +0xC |
+
+### Composite Time Hashing
+
+`sub_FFFFF803267F1E74` and `sub_FFFFF8032689A208` read **multiple** KUSER_SHARED_DATA fields (SystemTime, InterruptTime, +0x260, +0x2C4) and combine them with IMUL hash operations (multipliers `0x86B35EFB` / `0x2AD2F4E7`). This creates a composite timing fingerprint that's difficult for a hypervisor to consistently fake across all fields simultaneously.
+
+### Other Fields
+
+| Address | Field | Purpose |
+|---------|-------|---------|
+| `0xFFFFF8032683DFF7` | +0x320 (Cookie) | Stack cookie source |
+| `0xFFFFF803268580C1` | +0x320 (Cookie) | PRNG seeding |
+| `0xFFFFF803268B2122` | +0x274 (NtBuildNumber) | OS version fingerprint |
+| `0xFFFFF80326860D25` | +0x260 (NtMajorVersion) | OS version check |
+
+---
+
+## 8. WBINVD - Cache Flush Timing
+
+| Address | Function | VM Case |
+|---------|----------|---------|
+| `0xFFFFF803268D2786` | `sub_FFFFF803268D0280` | 293 |
+
+WBINVD flushes all cache lines to memory and invalidates them. Privileged instruction that causes a VM exit on all hypervisors. The VM exit overhead is measurable and cannot be hidden.
+
+---
+
+## 9. Physical Memory Scanning (Import-Based)
+
+| API | Purpose |
+|-----|---------|
+| `MmGetPhysicalMemoryRanges` | Enumerate all physical RAM ranges |
+| `MmCopyMemory` | Copy physical memory directly (bypass page tables) |
+| `MmMapIoSpaceEx` | Map physical MMIO regions |
+| `MmGetPhysicalAddress` | Virtual-to-physical address translation |
+| `MmGetVirtualForPhysical` | Reverse physical-to-virtual lookup |
+| `MmAllocateContiguousNodeMemory` | Allocate contiguous physical memory |
+
+Physical memory scanning detects:
+- EPT/NPT page table structures
+- VMCS (Virtual Machine Control Structure) regions
+- Hypervisor code signatures in memory
+- Extended Page Table Pointer (EPTP) values
+
+`KeSetSystemAffinityThreadEx` / `KeRevertToUserAffinityThreadEx` are used to pin threads to specific cores during timing measurements, preventing cross-core migration artifacts.
+
+---
+
+## 10. VM Instruction Dispatcher Summary
+
+The 11,400-byte dispatcher at `sub_FFFFF803268D0280` gives the VM bytecode full access to hardware probes:
+
+| Instruction | VM Case | Purpose |
+|------------|---------|---------|
+| CPUID | 120 | Execute arbitrary CPUID leaf |
+| RDTSC | 689 | Read timestamp counter |
+| RDTSCP | 690 | Read timestamp + processor ID |
+| RDMSR | 679 | Read arbitrary MSR |
+| WRMSR | near 679 | Write arbitrary MSR |
+| SGDT | 738 | Store GDT register |
+| SIDT | 754 | Store IDT register |
+| WBINVD | 293 | Flush + invalidate cache |
+
+Since these are invoked by VM bytecode in the 34 MB `seg007`, the specific detection logic is not statically visible without a VM bytecode emulator.
+
+---
+
+## 11. What EAC DOES and DOES NOT Check (Type-2 HV Focus)
+
+### Confirmed Detection Vectors (from dump)
+
+1. **CPUID leaf 1 ECX bit 31** - direct hypervisor present flag
+2. **RDTSC timing around CPUID** - 100-iteration calibrated loop detects VM exit latency
+3. **MSR 0x40000001** - Hyper-V synthetic MSR (faults on bare metal)
+4. **MSR 0x122 write-verify** - TSX control interception detection
+5. **MSR 0x34 SMI count** - anomaly detection
+6. **MSR 0x1B APIC base** - APIC virtualization detection
+7. **AMD perf counter MSR 0xC0010201** - alternative timing source with LFENCE
+8. **Intel PT MSRs 0x560/0x570** - PT interception detection
+9. **CR4 VMXE bit 13** - VMX enabled check
+10. **SGDT/SIDT** - descriptor table base anomaly
+11. **PCI config space** (ports 0xCF8/0xCFC) - direct hardware enumeration
+12. **Physical memory scanning** via MmCopyMemory - scans for HV artifacts
+13. **KUSER_SHARED_DATA composite timing** - cross-validates multiple time sources
+14. **WBINVD timing** - cache flush VM exit overhead
+15. **RDTSCP processor ID** - detects cross-core migration
+
+### NOT Found in Dump
+
+- No VMware backdoor port (0x5658) access in `.text`
+- No CPUID leaf 0x40000000 (hypervisor vendor string) in `.text` - may be in VM bytecode
+- No SLDT instruction found
+- No VMCALL/VMREAD/VMWRITE - EAC detects but does not interact with hypervisors
+- No explicit MSR 0x480 (IA32_VMX_BASIC) read in `.text`
+- No explicit MSR 0x3A (IA32_FEATURE_CONTROL) read in `.text`
+
+### What a Type-2 Hypervisor Must Handle
+
+To avoid detection by EAC:
+
+1. **Hide CPUID leaf 1 bit 31** - clear the hypervisor present bit in VM exit handler
+2. **Minimize CPUID VM exit latency** - the 100-iteration averaged timing loop is hard to fool
+3. **Handle MSR 0x40000001** - must #GP fault (don't expose Hyper-V interface unless needed)
+4. **Pass MSR 0x122 write-verify** - must actually toggle IA32_TSX_CTRL bit 0
+5. **Provide realistic MSR 0x34 SMI count** - forward the real counter
+6. **Keep APIC base consistent** - MSR 0x1B must match expected values
+7. **Handle Intel PT correctly** - MSRs 0x560/0x570/0x571 must work or consistently fail
+8. **Hide CR4.VMXE** - intercept CR4 reads and clear bit 13
+9. **Keep GDT/IDT bases normal** - don't relocate descriptor tables
+10. **Don't expose virtual PCI devices** - intercept port 0xCF8/0xCFC if needed
+11. **Clean physical memory** - no VMCS/EPT structures in scannable physical ranges
+12. **Consistent KUSER_SHARED_DATA** - all time fields must be coherent
+13. **Handle WBINVD efficiently** - minimize observable overhead
+14. **Match AMD perf counter behavior** - MSR 0xC0010201 must be realistic
+
+### Hardest to Bypass
+
+- **RDTSC-wrapped CPUID timing** (100 iterations + calibration) - near-zero overhead required
+- **MSR 0x122 write-verify** - must actually perform the MSR toggle
+- **Physical memory scanning** - requires hiding VMCS/EPT from MmCopyMemory
+- **Composite KUSER_SHARED_DATA hash** - multiple time sources must be coherent
+- **VM-protected checks in seg007** - unknown CPUID leaves and MSR checks at runtime
