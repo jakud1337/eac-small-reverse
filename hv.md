@@ -1,7 +1,5 @@
-# EAC Anti-Hypervisor Detection — Deep Analysis
-
+# EAC Anti-Hypervisor Detection 
 All data extracted from the live EAC runtime dump (`EasyAntiCheat_EOS_patched.sys`) via IDA bridge.
-
 ---
 
 ## 1. CPUID Timing Attack
